@@ -1,3 +1,5 @@
+# From https://github.com/facebookresearch/vggt/blob/main/vggt/utils/geometry.py, https://github.com/facebookresearch/vggt/blob/main/vggt/utils/rotation.py
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
