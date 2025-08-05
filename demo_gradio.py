@@ -298,7 +298,11 @@ def run_model(target_dir, model) -> dict:
     dtype = torch.bfloat16
     with torch.no_grad():
         with torch.amp.autocast('cuda', dtype=dtype):
+            start_time = time.time()
             predictions = model(imgs[None]) # Add batch dimension
+            end_time = time.time()
+            print(f"Inference time: {end_time - start_time:.3f} seconds")
+
     predictions['images'] = imgs[None].permute(0, 1, 3, 4, 2)
     predictions['conf'] = torch.sigmoid(predictions['conf'])
     edge = depth_edge(predictions['local_points'][..., 2], rtol=0.03)
@@ -461,6 +465,8 @@ def gradio_demo(
         show_cam=show_cam,
     )
     glbscene.export(file_obj=glbfile)
+
+    print(f"GLB file saved to {glbfile}")
 
     # Cleanup
     del predictions
