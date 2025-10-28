@@ -34,6 +34,7 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
             dinov3_checkpoint_path=None,
             use_motion_head=False, # using motion head for present and future prediction
             use_segmentation_head=True, # using segmentation head for present and future prediction
+            segmentation_num_classes=6,  # Number of segmentation classes
             use_detection_head=False,
             num_detection_classes=2,  # traffic light, road sign
             detection_architecture='dense',  # 'dense' or 'detr'
@@ -77,6 +78,7 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
 
         self.use_motion_head = use_motion_head
         self.use_segmentation_head = use_segmentation_head
+        self.segmentation_num_classes = segmentation_num_classes
 
         self.use_detection_head = use_detection_head
         self.num_detection_classes = num_detection_classes
@@ -209,7 +211,7 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
             self.segmentation_head = ImprovedFutureLinearPts3d(
                 patch_size=self.patch_size, 
                 dec_embed_dim=1024, 
-                output_dim=6,  # 6 classes: background, vehicle, bicycle, person, road sign, traffic light
+                output_dim=self.segmentation_num_classes,
                 extra_tokens=self.extra_tokens
             )
 
@@ -791,12 +793,14 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
             ar_dropout=0.1,
             freeze_decoders=False,  # Freeze point, conf, and camera decoders
             use_segmentation_head=False,  # Enable segmentation head
+            segmentation_num_classes=6,  # Number of segmentation classes
             use_motion_head=False,  # Enable motion head
         ):
         super().__init__()
 
         self.use_segmentation_head = use_segmentation_head
         self.use_motion_head = use_motion_head
+        self.segmentation_num_classes = segmentation_num_classes
 
         # ----------------------
         #        Encoder
@@ -928,7 +932,7 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
             self.segmentation_head = LinearPts3d(
                 patch_size=self.patch_size, 
                 dec_embed_dim=1024, 
-                output_dim=6,  # 6 classes: background, vehicle, bicycle, person, road sign, traffic light
+                output_dim=self.segmentation_num_classes,
             )
         
         # Motion decoder and head (optional)
