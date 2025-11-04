@@ -32,7 +32,8 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
             extra_tokens=3,
             encoder_name='dinov3',
             dinov3_checkpoint_path=None,
-            use_motion_head=False, # using motion head for present and future prediction
+            use_motion_head=True, # using motion head for present and future prediction
+            use_flow_head=False, # using optical flow head for present and future prediction
             use_segmentation_head=True, # using segmentation head for present and future prediction
             segmentation_num_classes=6,  # Number of segmentation classes
             use_detection_head=False,
@@ -77,6 +78,7 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
         self.extra_tokens = extra_tokens
 
         self.use_motion_head = use_motion_head
+        self.use_flow_head = use_flow_head
         self.use_segmentation_head = use_segmentation_head
         self.segmentation_num_classes = segmentation_num_classes
 
@@ -224,7 +226,20 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
             self.motion_head = ImprovedFutureLinearPts3d(
                 patch_size=self.patch_size, 
                 dec_embed_dim=1024, 
-                output_dim=3, 
+                output_dim=1,  # Binary motion mask (0=static, 1=moving)
+                extra_tokens=self.extra_tokens
+            )
+
+
+        if self.use_flow_head:
+            # flow decoder for predicting optical flow
+            self.flow_decoder = deepcopy(self.point_decoder)
+
+            # flow head outputs 2D optical flow (dx, dy)
+            self.flow_head = ImprovedFutureLinearPts3d(
+                patch_size=self.patch_size, 
+                dec_embed_dim=1024, 
+                output_dim=2,  # 2D optical flow (dx, dy)
                 extra_tokens=self.extra_tokens
             )
             
@@ -320,12 +335,16 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
         for param in self.camera_head.parameters():
             param.requires_grad = False
         
-        # NOTE: Segmentation decoder and head are intentionally NOT frozen
+        # NOTE: Segmentation, motion, and flow decoders/heads are intentionally NOT frozen
         # They need to train from scratch even when other decoders are frozen
         
         print("Froze point, conf, and camera decoders and heads")
         if self.use_segmentation_head:
             print("  ℹ️  Segmentation decoder/head remain trainable (not frozen)")
+        if self.use_motion_head:
+            print("  ℹ️  Motion decoder/head remain trainable (not frozen)")
+        if self.use_flow_head:
+            print("  ℹ️  Flow decoder/head remain trainable (not frozen)")
     
     def verify_gradient_flow(self):
         """Verify which parts of the model have gradients enabled."""
@@ -338,6 +357,19 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
             'camera_decoder': self.camera_decoder,
             'camera_head': self.camera_head,
         }
+        
+        # Add optional heads
+        if self.use_motion_head:
+            components['motion_decoder'] = self.motion_decoder
+            components['motion_head'] = self.motion_head
+            
+        if self.use_flow_head:
+            components['flow_decoder'] = self.flow_decoder
+            components['flow_head'] = self.flow_head
+            
+        if self.use_segmentation_head:
+            components['segmentation_decoder'] = self.segmentation_decoder
+            components['segmentation_head'] = self.segmentation_head
         
         # Add autoregressive transformer if it exists
         if hasattr(self, 'autoregressive_transformer'):
@@ -426,6 +458,10 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
 
         if self.use_motion_head:
             motion_hidden = self.motion_decoder(hidden, xpos=pos)
+
+
+        if self.use_flow_head:
+            flow_hidden = self.flow_decoder(hidden, xpos=pos)
         
         # Optional detection head processing
         detection_hidden = None
@@ -462,6 +498,17 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
                 motion_hidden = motion_hidden.float()
                 motion_flat = self.motion_head([motion_hidden[:, self.patch_start_idx:]], (H, W), B, N)
                 motion = motion_flat.reshape(B, total_frames, H, W, -1)
+            else:
+                motion = None
+
+            ##### flow - same temporal structure [B*(N+M), H, W, 2]
+            if self.use_flow_head:
+                # optical flow prediction 
+                flow_hidden = flow_hidden.float()
+                flow_flat = self.flow_head([flow_hidden[:, self.patch_start_idx:]], (H, W), B, N)
+                flow = flow_flat.reshape(B, total_frames, H, W, -1)
+            else:
+                flow = None
                 
 
             # segmentation prediction [B*(N+M), H, W, 9]
@@ -534,11 +581,13 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
         if self.use_motion_head:
             result_dict["motion"] = motion
         
+        if self.use_flow_head:
+            result_dict["flow"] = flow
+        
         if detections is not None:
             result_dict["detections"] = detections
             
         return result_dict
-
 
 
 
@@ -728,7 +777,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             'batch_info': {'B': B, 'N': N, 'H': H, 'W': W}
         }
     
-    def forward(self, imgs):
+    def forward(self, imgs, return_features=False):
         imgs = (imgs - self.image_mean) / self.image_std
 
         B, N, _, H, W = imgs.shape
@@ -740,8 +789,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
         if isinstance(hidden, dict):
             hidden = hidden["x_norm_patchtokens"]
+        dino_features = hidden
 
         hidden, pos = self.decode(hidden, N, H, W)
+        pi3_features = hidden
 
         point_hidden = self.point_decoder(hidden, xpos=pos)
         conf_hidden = self.conf_decoder(hidden, xpos=pos)
@@ -772,8 +823,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             conf=conf,
             camera_poses=camera_poses,
             features=hidden,  # [B*N, S, D] - decoder features for potential supervision
-            pos=pos           # [B*N, S, pos_dim] - positional encoding for
-
+            pos=pos,           # [B*N, S, pos_dim] - positional encoding for
+            dino_features=dino_features,  # [B*N, S, D] - DINOv2 encoder features for potential supervision
+            pi3_features=pi3_features  # [B*N, S, D] - Pi3 decoder features for potential supervision
         )
 
 
@@ -794,12 +846,14 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
             freeze_decoders=False,  # Freeze point, conf, and camera decoders
             use_segmentation_head=False,  # Enable segmentation head
             segmentation_num_classes=6,  # Number of segmentation classes
-            use_motion_head=False,  # Enable motion head
+            use_motion_head=True,  # Enable motion head
+            use_flow_head=False,  # Enable optical flow head
         ):
         super().__init__()
 
         self.use_segmentation_head = use_segmentation_head
         self.use_motion_head = use_motion_head
+        self.use_flow_head = use_flow_head
         self.segmentation_num_classes = segmentation_num_classes
 
         # ----------------------
@@ -941,7 +995,16 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
             self.motion_head = LinearPts3d(
                 patch_size=self.patch_size,
                 dec_embed_dim=1024,
-                output_dim=3,  # 3D motion vectors (dx, dy, dz)
+                output_dim=1,  # Binary motion mask (0=static, 1=moving)
+            )
+
+        # Flow decoder and head (optional)
+        if self.use_flow_head:
+            self.flow_decoder = deepcopy(self.point_decoder)
+            self.flow_head = LinearPts3d(
+                patch_size=self.patch_size,
+                dec_embed_dim=1024,
+                output_dim=2,  # 2D optical flow (dx, dy)
             )
 
         # Image normalization
@@ -1009,6 +1072,10 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
         if self.use_motion_head:
             components['motion_decoder'] = self.motion_decoder
             components['motion_head'] = self.motion_head
+        
+        if self.use_flow_head:
+            components['flow_decoder'] = self.flow_decoder
+            components['flow_head'] = self.flow_head
         
         for name, module in components.items():
             params_with_grad = sum(p.requires_grad for p in module.parameters())
@@ -1092,6 +1159,9 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
         if self.use_motion_head:
             motion_hidden = self.motion_decoder(all_hidden, xpos=all_pos)
 
+        if self.use_flow_head:
+            flow_hidden = self.flow_decoder(all_hidden, xpos=all_pos)
+
         with torch.amp.autocast(device_type='cuda', enabled=False):
             # Generate predictions for all frames
             # Points - [B*total_frames, H, W, 3]
@@ -1121,13 +1191,21 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
             else:
                 segmentation = None
             
-            # Motion - [B*total_frames, H, W, 3]
+            # Motion - [B*total_frames, H, W, 1]
             if self.use_motion_head:
                 motion_hidden = motion_hidden.float()
                 motion_flat = self.motion_head([motion_hidden[:, self.patch_start_idx:]], (H, W))
-                motion = motion_flat.reshape(B, total_frames, H, W, -1)  # 3D motion vectors
+                motion = motion_flat.reshape(B, total_frames, H, W, -1)  # Binary motion masks
             else:
                 motion = None
+
+            # Flow - [B*total_frames, H, W, 2]
+            if self.use_flow_head:
+                flow_hidden = flow_hidden.float()
+                flow_flat = self.flow_head([flow_hidden[:, self.patch_start_idx:]], (H, W))
+                flow = flow_flat.reshape(B, total_frames, H, W, -1)  # 2D optical flow (dx, dy)
+            else:
+                flow = None
 
             # Unproject local points using camera poses
             points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
@@ -1146,6 +1224,9 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
         
         if self.use_motion_head:
             result['motion'] = motion
+        
+        if self.use_flow_head:
+            result['flow'] = flow
         
         # Always include decoder features for potential supervision
         result['all_decoder_features'] = all_hidden  # Current + future decoder features [B*(N+M), S, D]
