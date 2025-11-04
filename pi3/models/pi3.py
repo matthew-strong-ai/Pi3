@@ -1017,6 +1017,30 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
         if freeze_decoders:
             self._freeze_decoders()
 
+    def _unfreeze_decoders(self):
+        """Unfreeze main decoder and task-specific decoders and heads to force better token representation learning.
+        NOTE: Segmentation decoder/head are NOT frozen even when freeze_decoders=True, 
+        as they need to learn from scratch."""
+        # Unfreeze main decoder
+        # for param in self.decoder.parameters():
+        #     param.requires_grad = False
+        
+        # unFreeze task decoders
+        for param in self.point_decoder.parameters():
+            param.requires_grad = True
+        for param in self.conf_decoder.parameters():
+            param.requires_grad = True
+        for param in self.camera_decoder.parameters():
+            param.requires_grad = True
+        
+        # unFreeze heads
+        for param in self.point_head.parameters():
+            param.requires_grad = True
+        for param in self.conf_head.parameters():
+            param.requires_grad = True
+        for param in self.camera_head.parameters():
+            param.requires_grad = True
+
     def _freeze_decoders(self):
         """Freeze main decoder and task-specific decoders and heads to force better token representation learning.
         NOTE: Segmentation decoder/head are NOT frozen even when freeze_decoders=True, 
@@ -1139,11 +1163,14 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
         if isinstance(hidden, dict):
             hidden = hidden["x_norm_patchtokens"]
 
+        dino_features = hidden
         # Decode and aggregate spatial-temporal features
         hidden, pos = self.decode(hidden, N, H, W)
+        pi3_features = hidden
 
         # Generate future tokens autoregressively
         all_hidden, all_pos = self.autoregressive_transformer(hidden, N, pos)
+        autonomy_features = all_hidden  # [B*(N+M), S, D] - all features including future frames from AR transformer
 
         # Udoate frame count to include future frames
         total_frames = N + self.n_future_frames
@@ -1152,6 +1179,11 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
         point_hidden = self.point_decoder(all_hidden, xpos=all_pos)
         conf_hidden = self.conf_decoder(all_hidden, xpos=all_pos)
         camera_hidden = self.camera_decoder(all_hidden, xpos=all_pos)
+
+        # lets get point, conf, cam features for all frames (current + future)
+        point_features = point_hidden
+        conf_features = conf_hidden
+        camera_features = camera_hidden
         
         if self.use_segmentation_head:
             segmentation_hidden = self.segmentation_decoder(all_hidden, xpos=all_pos)
@@ -1216,7 +1248,13 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
             conf=conf,
             camera_poses=camera_poses,
             n_current_frames=N,
-            n_future_frames=self.n_future_frames
+            n_future_frames=self.n_future_frames,
+            dino_features=dino_features,  # [B*N, S, D] - DINOv2 encoder features for potential supervision
+            pi3_features=pi3_features,    # [B*N, S, D]
+            autonomy_features=autonomy_features,  # [B*(N+M), S, D] - all features including future frames from AR transformer,
+            point_features=point_features,  # [B*(N+M), S, D]
+            conf_features=conf_features,    # [B*(N+M), S, D
+            camera_features=camera_features   # [B*(N+M), S, D]
         )
         
         if self.use_segmentation_head:
