@@ -10,6 +10,8 @@ from .layers.block import BlockRope
 from .layers.attention import FlashAttentionRope
 from .layers.transformer_head import TransformerDecoder, LinearPts3d, FutureLinearPts3d, AutoregressiveFuturePts3d
 from .layers.improved_temporal_head import ImprovedFutureLinearPts3d
+from .layers.refined_point_head import RefinedLinearPts3d
+from .layers.conv_point_head import ConvLinearPts3d, SimpleConvPts3d
 from .layers.camera_head import CameraHead, FutureCameraHead
 from .layers.autoregressive_transformer import AutoregressiveTokenTransformer
 from .dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg
@@ -151,6 +153,8 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
         self.patch_start_idx = num_register_tokens
         self.register_token = nn.Parameter(torch.randn(1, 1, num_register_tokens, self.dec_embed_dim))
         nn.init.normal_(self.register_token, std=1e-6)
+
+        
 
         # ----------------------
         #  Local Points Decoder
@@ -312,6 +316,7 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
         self.register_buffer("image_mean", image_mean)
         self.register_buffer("image_std", image_std)
         # Freeze decoders if requested
+        
         if freeze_decoders:
             self._freeze_decoders()
 
@@ -447,6 +452,7 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
         hidden, pos = self.decode(hidden, N, H, W)
 
         # with hidden state, we can add a detection head!
+        # have lightweight decoders for point, conf prediction
 
         point_hidden = self.point_decoder(hidden, xpos=pos)
         conf_hidden = self.conf_decoder(hidden, xpos=pos)
@@ -458,7 +464,6 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
 
         if self.use_motion_head:
             motion_hidden = self.motion_decoder(hidden, xpos=pos)
-
 
         if self.use_flow_head:
             flow_hidden = self.flow_decoder(hidden, xpos=pos)
@@ -510,7 +515,6 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
             else:
                 flow = None
                 
-
             # segmentation prediction [B*(N+M), H, W, 9]
             if self.use_segmentation_head:
                 segmentation_hidden = segmentation_hidden.float()
@@ -798,6 +802,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         conf_hidden = self.conf_decoder(hidden, xpos=pos)
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
 
+        point_features = point_hidden
+        conf_features = conf_hidden
+        camera_features = camera_hidden
+
         with torch.amp.autocast(device_type='cuda', enabled=False):
             # local points
             point_hidden = point_hidden.float()
@@ -825,7 +833,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             features=hidden,  # [B*N, S, D] - decoder features for potential supervision
             pos=pos,           # [B*N, S, pos_dim] - positional encoding for
             dino_features=dino_features,  # [B*N, S, D] - DINOv2 encoder features for potential supervision
-            pi3_features=pi3_features  # [B*N, S, D] - Pi3 decoder features for potential supervision
+            pi3_features=pi3_features,  # [B*N, S, D] - Pi3 decoder features for potential supervision
+            camera_features=camera_features,
+            conf_features=conf_features,
+            point_features=point_features
         )
 
 
@@ -848,13 +859,17 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
             segmentation_num_classes=6,  # Number of segmentation classes
             use_motion_head=True,  # Enable motion head
             use_flow_head=False,  # Enable optical flow head
+            point_head_type='linear',  # Options: 'linear', 'refined', 'conv', 'simple_conv'
+            point_head_config=None,  # Config for the point head
         ):
         super().__init__()
-
+        point_head_type = 'simple_conv'
         self.use_segmentation_head = use_segmentation_head
         self.use_motion_head = use_motion_head
         self.use_flow_head = use_flow_head
         self.segmentation_num_classes = segmentation_num_classes
+        self.point_head_type = point_head_type
+        self.point_head_config = point_head_config or {}
 
         # ----------------------
         #        Encoder
@@ -944,6 +959,15 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
             max_seq_len=10  # Can handle up to 10 frames total
         )
 
+        # testing out new decoder
+        self.modality_decoder = TransformerDecoder(
+            in_dim=2*self.dec_embed_dim, 
+            dec_embed_dim=1024,
+            dec_num_heads=8,
+            out_dim=1024,
+            rope=self.rope,
+        )
+
         # ----------------------
         #  Task-specific Decoders
         # ----------------------
@@ -951,15 +975,40 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
         self.point_decoder = TransformerDecoder(
             in_dim=2*self.dec_embed_dim, 
             dec_embed_dim=1024,
-            dec_num_heads=16,
+            dec_num_heads=8,
             out_dim=1024,
             rope=self.rope,
         )
-        self.point_head = LinearPts3d(
-            patch_size=self.patch_size, 
-            dec_embed_dim=1024, 
-            output_dim=3
-        )
+        # Initialize point head based on type
+        if self.point_head_type == 'linear':
+            self.point_head = LinearPts3d(
+                patch_size=self.patch_size, 
+                dec_embed_dim=1024, 
+                output_dim=3
+            )
+        elif self.point_head_type == 'refined':
+            self.point_head = RefinedLinearPts3d(
+                patch_size=self.patch_size, 
+                dec_embed_dim=1024, 
+                output_dim=3,
+                **self.point_head_config
+            )
+        elif self.point_head_type == 'conv':
+            self.point_head = ConvLinearPts3d(
+                patch_size=self.patch_size, 
+                dec_embed_dim=1024, 
+                output_dim=3,
+                **self.point_head_config
+            )
+        elif self.point_head_type == 'simple_conv':
+            self.point_head = SimpleConvPts3d(
+                patch_size=self.patch_size, 
+                dec_embed_dim=1024, 
+                output_dim=3,
+                **self.point_head_config
+            )
+        else:
+            raise ValueError(f"Unknown point head type: {self.point_head_type}")
 
         # Confidence decoder
         self.conf_decoder = deepcopy(self.point_decoder)
@@ -973,12 +1022,12 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
         self.camera_decoder = TransformerDecoder(
             in_dim=2*self.dec_embed_dim, 
             dec_embed_dim=1024,
-            dec_num_heads=16,                # 8
+            dec_num_heads=8,                # 8
             out_dim=512,
             rope=self.rope,
             use_checkpoint=False
         )
-        self.camera_head = CameraHead(dim=512)
+        self.camera_head = CameraHead(dim=1024)
 
         # Segmentation decoder and head (optional)
         if self.use_segmentation_head:
@@ -1172,18 +1221,24 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
         all_hidden, all_pos = self.autoregressive_transformer(hidden, N, pos)
         autonomy_features = all_hidden  # [B*(N+M), S, D] - all features including future frames from AR transformer
 
-        # Udoate frame count to include future frames
+        # Update frame count to include future frames
         total_frames = N + self.n_future_frames
-        
+
+        # maybe we can use a lightweight head just on top of the AR transformer, a broad modality decoder
+        modality_hidden = self.modality_decoder(all_hidden, xpos=all_pos)
+
         # Process all tokens (current + future) through task decoders
-        point_hidden = self.point_decoder(all_hidden, xpos=all_pos)
-        conf_hidden = self.conf_decoder(all_hidden, xpos=all_pos)
-        camera_hidden = self.camera_decoder(all_hidden, xpos=all_pos)
+        # point_hidden = self.point_decoder(all_hidden, xpos=all_pos)
+        # conf_hidden = self.conf_decoder(all_hidden, xpos=all_pos)
+        # camera_hidden = self.camera_decoder(all_hidden, xpos=all_pos)
 
         # lets get point, conf, cam features for all frames (current + future)
-        point_features = point_hidden
-        conf_features = conf_hidden
-        camera_features = camera_hidden
+        point_features = modality_hidden
+        conf_features = modality_hidden
+        camera_features = modality_hidden
+        # point_features = point_hidden
+        # conf_features = conf_hidden
+        # camera_features = camera_hidden
         
         if self.use_segmentation_head:
             segmentation_hidden = self.segmentation_decoder(all_hidden, xpos=all_pos)
@@ -1197,7 +1252,9 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
         with torch.amp.autocast(device_type='cuda', enabled=False):
             # Generate predictions for all frames
             # Points - [B*total_frames, H, W, 3]
-            point_hidden = point_hidden.float()
+            # point_hidden = point_hidden.float()
+            point_hidden = modality_hidden.float()
+
             local_points_flat = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W))
             local_points_raw = local_points_flat.reshape(B, total_frames, H, W, -1)
             
@@ -1206,12 +1263,12 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
             local_points = torch.cat([xy * z, z], dim=-1)
 
             # Confidence - [B*total_frames, H, W, 1]
-            conf_hidden = conf_hidden.float()
+            conf_hidden = modality_hidden.float()
             conf_flat = self.conf_head([conf_hidden[:, self.patch_start_idx:]], (H, W))
             conf = conf_flat.reshape(B, total_frames, H, W, -1)
 
             # Camera poses - [B*total_frames, 4, 4]
-            camera_hidden = camera_hidden.float()
+            camera_hidden = modality_hidden.float()
             camera_poses_flat = self.camera_head(camera_hidden[:, self.patch_start_idx:], patch_h, patch_w)
             camera_poses = camera_poses_flat.reshape(B, total_frames, 4, 4)
 
