@@ -863,7 +863,7 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
             point_head_config=None,  # Config for the point head
         ):
         super().__init__()
-        point_head_type = 'simple_conv'
+        point_head_type = 'conv'
         self.use_segmentation_head = use_segmentation_head
         self.use_motion_head = use_motion_head
         self.use_flow_head = use_flow_head

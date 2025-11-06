@@ -67,7 +67,7 @@ class RefinedLinearPts3d(nn.Module):
         
         # Initial 3D point prediction
         feat = self.proj(tokens)  # B,S,D
-        feat = feat.transpose(-1, -2).view(B, -1, H//self.patch_size, W//self.patch_size)
+        feat = feat.transpose(-1, -2).reshape(B, -1, H//self.patch_size, W//self.patch_size)
         feat = F.pixel_shuffle(feat, self.patch_size)  # B,output_dim,H,W
         
         # Project to refinement dimension

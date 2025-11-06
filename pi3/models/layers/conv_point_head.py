@@ -83,7 +83,7 @@ class ConvLinearPts3d(nn.Module):
         
         # Reshape to image-like tensor
         ps_half = self.patch_size // 2
-        x = x.transpose(-1, -2).view(B, -1, H // self.patch_size * ps_half, W // self.patch_size * ps_half)
+        x = x.transpose(-1, -2).reshape(B, -1, H // self.patch_size * ps_half, W // self.patch_size * ps_half)
         
         # Apply convolutional layers
         for i, (conv, norm) in enumerate(zip(self.conv_layers, self.norms)):
@@ -147,7 +147,7 @@ class SimpleConvPts3d(nn.Module):
         
         # Project and reshape
         feat = self.proj(tokens)  # B,S,D
-        feat = feat.transpose(-1, -2).view(B, -1, H//self.patch_size, W//self.patch_size)
+        feat = feat.transpose(-1, -2).reshape(B, -1, H//self.patch_size, W//self.patch_size)
         feat = F.pixel_shuffle(feat, self.patch_size)  # B,hidden_dims[0],H,W
         
         # Apply conv network
