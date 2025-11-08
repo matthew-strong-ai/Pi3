@@ -315,8 +315,10 @@ def run_model(target_dir, model) -> dict:
 
     # Convert tensors to numpy
     for key in predictions.keys():
-        if isinstance(predictions[key], torch.Tensor):
-            predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension
+        if key not in ['features', 'pos', 'dino_features', 'pi3_features', 'conf_features', 'camera_features',
+                        'point_features']:
+            if isinstance(predictions[key], torch.Tensor):
+                predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension
 
     # Clean up
     torch.cuda.empty_cache()

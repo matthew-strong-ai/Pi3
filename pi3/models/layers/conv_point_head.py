@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class ConvLinearPts3d(nn.Module):
     """
     Convolutional point head for Pi3 model.
@@ -19,7 +18,7 @@ class ConvLinearPts3d(nn.Module):
         hidden_dim=512,
         num_conv_layers=3,
         kernel_size=3,
-        use_batch_norm=False,
+        use_batch_norm=True,
         activation='gelu'
     ):
         super().__init__()
