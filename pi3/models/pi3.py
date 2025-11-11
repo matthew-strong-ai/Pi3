@@ -874,7 +874,7 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
         #        Encoder
         # ----------------------
         if encoder_name == 'dinov2':
-            self.encoder = dinov2_vitl14_reg(pretrained=False)
+            self.encoder = dinov2_vitl14_reg(pretrained=True)
             self.patch_size = 14
             del self.encoder.mask_token
         else:
@@ -1239,9 +1239,6 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
         camera_hidden = self.camera_decoder(all_hidden, xpos=all_pos)
 
         # lets get point, conf, cam features for all frames (current + future)
-        # point_features = modality_hidden
-        # conf_features = modality_hidden
-        # camera_features = modality_hidden
         point_features = point_hidden
         conf_features = conf_hidden
         camera_features = camera_hidden
@@ -1256,7 +1253,6 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
             flow_hidden = self.flow_decoder(all_hidden, xpos=all_pos)
 
         with torch.amp.autocast(device_type='cuda', enabled=False):
-            # Generate predictions for all frames
             # Points - [B*total_frames, H, W, 3]
             point_hidden = point_hidden.float()
             # point_hidden = modality_hidden.float()
