@@ -8,7 +8,7 @@ from .simple_positional_encoding import SimpleLearnablePositionalEncoding, RoPE2
 class TemporalPositionalEncoding(nn.Module):
     """Learnable temporal positional encoding for sequence modeling."""
     
-    def __init__(self, d_model, max_len=10):
+    def __init__(self, d_model, max_len=15):
         super().__init__()
         self.max_len = max_len
         self.d_model = d_model
@@ -135,7 +135,7 @@ class AutoregressiveTokenTransformer(nn.Module):
                  d_ff=2048,
                  dropout=0.1,
                  n_future_frames=3,
-                 max_seq_len=10,
+                 max_seq_len=15,
                  positional_encoding='spatiotemporal',  # 'temporal', 'spatiotemporal', or 'sinusoidal'
                  max_spatial_size=64*64):
         super().__init__()
@@ -205,33 +205,37 @@ class AutoregressiveTokenTransformer(nn.Module):
         B, T, S, D = tokens.shape
         return tokens.view(B * T, S, D)
     
-    def forward(self, hidden, N, pos=None):
+    def forward(self, hidden, N, pos=None, n_future_frames_override=None):
         """
         Forward pass to generate future tokens autoregressively.
-        
+
         Args:
             hidden: [B*N, S, D] - aggregated tokens from decode()
             N: number of current frames
             pos: [B*N, S, 2] - positional encoding from decode()
-            
+            n_future_frames_override: Optional override for n_future_frames (useful for alternating training)
+
         Returns:
             all_hidden: [B*(N+M), S, D] - current + future tokens
             all_pos: [B*(N+M), S, 2] - positional encoding for all tokens
         """
+        # Use override if provided, otherwise use default
+        n_future = n_future_frames_override if n_future_frames_override is not None else self.n_future_frames
+
         # Validate inputs
         BN, S, D = hidden.shape
         assert BN % N == 0, f"Batch size mismatch: {BN} not divisible by {N}"
         assert D == self.d_model, f"Feature dimension mismatch: got {D}, expected {self.d_model}"
-        
+
         # Reshape to temporal sequence
         tokens = self.reshape_to_temporal(hidden, N)  # [B, N, S, D]
         B, _, S, D = tokens.shape
-        
+
         # Start with current tokens
         all_tokens = tokens
-        
+
         # Generate future tokens autoregressively
-        for i in range(self.n_future_frames):
+        for i in range(n_future):
             # Current sequence length
             current_seq_len = all_tokens.shape[1]
             
@@ -264,7 +268,7 @@ class AutoregressiveTokenTransformer(nn.Module):
             # Use the first frame's spatial pattern for all future frames
             # (spatial positions should be consistent across time)
             spatial_pattern = pos_per_frame[:, 0:1, :, :]  # [B, 1, S, pos_dim]
-            future_pos = spatial_pattern.repeat(1, self.n_future_frames, 1, 1)  # [B, M, S, pos_dim]
+            future_pos = spatial_pattern.repeat(1, n_future, 1, 1)  # [B, M, S, pos_dim]
             
             all_pos_frames = torch.cat([pos_per_frame, future_pos], dim=1)  # [B, N+M, S, pos_dim]
             all_pos = all_pos_frames.view(-1, S, pos_per_frame.shape[-1])  # [B*(N+M), S, pos_dim]

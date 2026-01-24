@@ -64,7 +64,7 @@ class AutonomyPi3(nn.Module, PyTorchModelHubMixin):
         # ----------------------
         # Use provided checkpoint path or fallback to hardcoded path
         weights_path = dinov3_checkpoint_path or DINOV3_WEIGHTS
-        
+        encoder_name = 'dinov2'
         if encoder_name == 'dinov3':
             self.encoder = torch.hub.load('dinov3', 'dinov3_vitl16', source='local', weights=weights_path)
             self.encoder.train()
@@ -955,7 +955,7 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
             d_ff=3 * self.dec_embed_dim,
             dropout=ar_dropout,
             n_future_frames=n_future_frames,
-            max_seq_len=10  # Can handle up to 10 frames total
+            max_seq_len=15  # Can handle up to 15 frames total
         )
 
         # testing out new decoder
@@ -1202,7 +1202,15 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
 
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B*N, hw, -1)
     
-    def forward(self, imgs):
+    def forward(self, imgs, n_future_frames_override=None):
+        """
+        Forward pass for AutoregressivePi3.
+
+        Args:
+            imgs: Input images [B, N, C, H, W]
+            n_future_frames_override: Optional override for n_future_frames (useful for alternating training)
+                                     Set to 0 for current-frames-only mode (no AR work)
+        """
         imgs = (imgs - self.image_mean) / self.image_std
 
         B, N, _, H, W = imgs.shape
@@ -1224,14 +1232,12 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
         pi3_features = hidden
 
         # Generate future tokens autoregressively
-        all_hidden, all_pos = self.autoregressive_transformer(hidden, N, pos)
+        all_hidden, all_pos = self.autoregressive_transformer(hidden, N, pos, n_future_frames_override=n_future_frames_override)
         autonomy_features = all_hidden  # [B*(N+M), S, D] - all features including future frames from AR transformer
 
         # Update frame count to include future frames
-        total_frames = N + self.n_future_frames
-
-        # maybe we can use a lightweight head just on top of the AR transformer, a broad modality decoder
-        # modality_hidden = self.modality_decoder(all_hidden, xpos=all_pos)
+        n_future = n_future_frames_override if n_future_frames_override is not None else self.n_future_frames
+        total_frames = N + n_future
 
         # Process all tokens (current + future) through task decoders
         point_hidden = self.point_decoder(all_hidden, xpos=all_pos)
@@ -1309,7 +1315,7 @@ class AutoregressivePi3(nn.Module, PyTorchModelHubMixin):
             conf=conf,
             camera_poses=camera_poses,
             n_current_frames=N,
-            n_future_frames=self.n_future_frames,
+            n_future_frames=n_future,  # Actual n_future used (may be overridden)
             dino_features=dino_features,  # [B*N, S, D] - DINOv2 encoder features for potential supervision
             pi3_features=pi3_features,    # [B*N, S, D]
             autonomy_features=autonomy_features,  # [B*(N+M), S, D] - all features including future frames from AR transformer,
