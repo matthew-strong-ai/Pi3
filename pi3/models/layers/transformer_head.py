@@ -59,7 +59,7 @@ class TransformerDecoder(nn.Module):
         return out
 
 class LinearPts3d (nn.Module):
-    """ 
+    """
     Linear head for dust3r
     Each token outputs: - 16x16 3D points (+ confidence)
     """

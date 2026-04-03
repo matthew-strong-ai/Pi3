@@ -1,0 +1,163 @@
+# Default Pi3 Training Configuration
+# This file is automatically loaded by train_cluster.py
+
+# Dataset parameters
+DATASET:
+  # Local dataset (legacy support), won't be used for s3
+  ROOT_DIR: "/home/matthew_strong/Desktop/autonomy-wild/test_dataset"  # Root directory containing subfolders of images
+  
+  # YouTube S3 dataset configuration (NEW!)
+  USE_YOUTUBE: True               # Use YouTube S3 dataset (58+ million samples!)
+  USE_S3: False                   # Disable old S3 dataset
+  S3_BUCKET: "research-datasets"  # S3 bucket name
+  
+  # YouTube-specific settings
+  YOUTUBE_ROOT_PREFIX: "openDV-YouTube/full_images/"
+  YOUTUBE_CACHE_DIR: "./youtube_cache"
+  YOUTUBE_REFRESH_CACHE: False    # Set True to rebuild cache (takes time!)
+  YOUTUBE_SKIP_FRAMES: 300        # Skip first 300 frames per video
+  YOUTUBE_MIN_SEQUENCE_LENGTH: 50 # Minimum frames in video
+  YOUTUBE_MAX_WORKERS: 32         # Parallel S3 workers for initial indexing
+  MAX_SAMPLES: -1                # Limit dataset to 100 samples for testing (set to -1 for full dataset)
+  FRAME_SAMPLING_RATE: 2         # Sample every Nth frame (1=10Hz, 5=2Hz) from source 10Hz videos
+  
+  # Multi-rate training configuration
+  USE_MULTI_RATE_TRAINING: False   # Enable training with multiple frame rates
+  MULTI_RATE_FRAME_RATES: [1, 2, 5]  # Train on 10Hz, 5Hz, and 2Hz data
+  MULTI_RATE_WEIGHTS: null        # Sampling weights for each rate (null = uniform)
+  
+  # Old S3 dataset configuration (DISABLED - keeping for reference)  
+  # USE_S3: True                    # Use S3 dataset instead of local files
+  # S3_BUCKET: "research-datasets"  # S3 bucket name
+  S3_SEQUENCE_PREFIXES:           # List of S3 prefixes for image sequences (LEGACY)
+    - "autonomy_youtube/sf_day/"
+    - "autonomy_youtube/smoky_mountains/"
+
+  S3_IMAGE_EXTENSION: ".png"      # Image file extension in S3 (LEGACY)
+  S3_REGION: "us-phoenix-1"      # Oracle Cloud region for YouTube dataset
+  S3_PRELOAD_BYTES: False        # Preload all bytes for multiprocessing (LEGACY)
+  
+  BATCH_SIZE: 1                   # Batch size for training (increased for YouTube scale)
+  VAL_SPLIT: 0.05                # Fraction of data to use for validation (smaller for huge dataset)
+  
+
+# Model parameters 
+MODEL:
+  M: 3                         # Number of input frames
+  N: 3                           # Number of target frames
+  GRID_SIZE: 10                  # Grid size for query points1
+  ENCODER_NAME: "dinov2"         # Encoder type: "dinov2" or "dinov3"
+  ARCHITECTURE: "AutoregressivePi3"    # Model architecture: "AutonomyPi3" or "AutoregressivePi3"
+  
+  # AutoregressivePi3 specific parameters
+  AR_N_HEADS: 8                # Number of attention heads for autoregressive transformer
+  AR_N_LAYERS: 4                # Number of layers for autoregressive transformer
+  AR_DROPOUT: 0.1               # Dropout rate for autoregressive transformer
+  
+  USE_DETECTION_HEAD: False      # Enable optional detection head for traffic lights/road signs
+  NUM_DETECTION_CLASSES: 2       # Number of detection classes (traffic light, road sign)
+  
+  # Detection head architecture options
+  DETECTION_ARCHITECTURE: "dense"  # Detection architecture: 
+                                    # "dense" - Per-patch grid predictions (original)
+                                    # "detr"  - Set-based object queries with Hungarian matching
+  NUM_OBJECT_QUERIES: 100        # Number of object queries for DETR (only used if DETECTION_ARCHITECTURE="detr")
+  DETR_HIDDEN_DIM: 256          # DETR decoder hidden dimension
+  DETR_NUM_HEADS: 8             # Number of attention heads in DETR decoder
+  DETR_NUM_LAYERS: 6            # Number of DETR decoder layers
+
+  USE_MOTION_HEAD: False    # Enable optional motion prediction head for point motion estimation
+  USE_FLOW_HEAD: False      # Enable optional optical flow prediction head for 2D flow estimation
+  USE_SEGMENTATION_HEAD: False    # Enable optional segmentation head for per-pixel segmentation
+  SEGMENTATION_MODEL: "segformer"    # Segmentation model: "gsam2", "segformer", "deeplabv3"
+  SEGMENTATION_NUM_CLASSES: 7    # Number of segmentation classes (6 for GSAM2, 7 for Cityscapes)
+  FREEZE_DECODERS: True    # Freeze point, conf, and camera decoders/heads to improve token representations
+  USE_FROZEN_DECODER_SUPERVISION: False  # Use frozen model's decoder features as supervision for autoregressive transformer
+  
+  # Distilled ViT parameters
+  USE_DISTILLED_VIT: True         # Enable distilled ViT training
+  DISTILLED_VIT:
+    EMBED_DIM: 768                 # Student embedding dimension
+    DEPTH: 12                      # Number of transformer layers
+    NUM_HEADS: 12                  # Number of attention heads
+    DISTILL_TOKENS: ['autonomy_features']  # Features to distill
+    TEMPERATURE: 4.0               # Distillation temperature
+    USE_COSINE_SIMILARITY: True    # Use cosine similarity loss
+
+
+POINT_MOTION: 
+  TRAIN_MOTION: False    # Enable motion ground truth computation using CoTracker3
+  MOTION_THRESHOLD: 0.2  # Threshold for converting motion magnitude to binary mask (meters)
+
+# Motion Detection parameters (using optical flow)
+MOTION_DETECTION:
+  ENABLE: False                    # Enable flow-based motion detection
+  MOTION_THRESHOLD: 0.1           # 3D motion threshold in meters per frame
+  TEMPORAL_WINDOW: 5              # Number of frames for object motion classification
+  CONSISTENCY_THRESHOLD: 0.6      # Fraction of frames that must be dynamic for classification
+  CAMERA_MOTION_COMPENSATION: True # Remove camera motion from object motion
+  SAVE_MOTION_VISUALIZATIONS: True # Save motion field and dynamic object visualizations
+  MAX_MOTION_DISPLAY: 1.0         # Maximum motion magnitude for visualization scaling
+  VISUALIZATION_SUBSAMPLE: 16     # Arrow plot subsampling factor
+
+# GroundingDINO Detection parameters
+DETECTION:
+  USE_GROUNDING_DINO: False      # Enable GroundingDINO for detection
+  GDINO_CONFIG_PATH: "gdino_config/GroundingDINO_SwinT_OGC.py"  # Path to config file
+  GDINO_WEIGHTS_PATH: "gdino/groundingdino_swint_ogc.pth"          # Path to weights
+  TEXT_PROMPT: "traffic light . road sign"  # Detection text prompt
+  BOX_THRESHOLD: 0.35             # Detection confidence threshold
+  TEXT_THRESHOLD: 0.25           # Text-image similarity threshold
+
+# Training parameters
+TRAINING:
+  NUM_EPOCHS: 5000                  # Number of training epochs
+  LEARNING_RATE: 1e-4         # Learning rate
+  WARMUP_STEPS: 500             # Number of warmup steps for learning rate scheduler
+  WARMUP_START_FACTOR: 0.1      # Starting factor for warmup (lr will start at lr * warmup_start_factor)
+  GRAD_ACCUM_STEPS: 1          # Number of gradient accumulation steps (effective batch size = BATCH_SIZE * GRAD_ACCUM_STEPS)
+  MAX_GRAD_NORM: 1.0            # Max gradient norm for clipping
+
+# Loss weights
+LOSS:
+  USE_CONF_WEIGHTED_POINTS: False
+  PC_LOSS_WEIGHT: 1.0           # Point cloud loss weight
+  POSE_LOSS_WEIGHT: 0.1         # Camera pose loss weight
+  CONF_LOSS_WEIGHT: 0.05         # Confidence loss weight
+  SEGMENTATION_LOSS_WEIGHT: 1.0   # Segmentation loss weight (GroundingDINO supervision), usually 1.0
+  NORMAL_LOSS_WEIGHT: 10.0       # Normal loss weight (0.0 disables it)
+  DETECTION_LOSS_WEIGHT: 0.0     # Detection loss weight (GroundingDINO supervision, 0.0 disables it)
+  FUTURE_FRAME_WEIGHT:   10.0      # Weight multiplier for future frame supervision (>1.0 emphasizes future frames, 0.0 = current frames only)
+  MOTION_LOSS_WEIGHT: 1.0         # Motion loss weight (0.0 disables it)
+  FLOW_LOSS_WEIGHT: 0.1           # Optical flow loss weight (0.0 disables it)
+  FROZEN_DECODER_SUPERVISION_WEIGHT: 0.0  # Weight for frozen model decoder supervision loss
+
+# Validation parameters
+VALIDATION:
+  VAL_FREQ: 500              # Validate every N steps
+  VAL_SAMPLES: 100               # Number of validation samples to use (-1 for all)
+  EARLY_STOPPING_PATIENCE: 10  # Early stopping patience (number of validation checks without improvement)
+
+# Logging parameters
+LOGGING:
+  LOG_FREQ: 100                  # Log every N steps
+  SAVE_FREQ: 1000               # Check for best model every N steps
+  N_VISUALIZE: 3                # Number of random batches to visualize before training
+
+# Output parameters
+OUTPUT:
+  CHECKPOINT_DIR: "checkpoints"  # Directory to save checkpoints
+  SAVE_NPZ: False               # Save npz files  
+  SAVE_DEPTHS: True             # Save depths files (every 200 steps)
+  SAVE_SEGMENTATION: True      # Save segmentation files (every 200 steps)
+  
+  # S3 checkpoint upload
+  UPLOAD_TO_S3: True        # Upload best checkpoints to S3
+  S3_BUCKET: "research-datasets"  # S3 bucket for checkpointts
+  S3_PREFIX: "autonomy_checkpoints"  # S3 prefix/folder
+
+# W&B parameters
+WANDB:
+  PROJECT: "autonomy-wild" # Weights & Biases project name
+  USE_WANDB: True               # Enable Weights & Biases logging
+  RUN_NAME: "matt-pi3-final-seg-1-diff"  # W&B run name (optional)

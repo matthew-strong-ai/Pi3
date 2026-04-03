@@ -298,11 +298,7 @@ def run_model(target_dir, model) -> dict:
     dtype = torch.bfloat16
     with torch.no_grad():
         with torch.amp.autocast('cuda', dtype=dtype):
-            start_time = time.time()
             predictions = model(imgs[None]) # Add batch dimension
-            end_time = time.time()
-            print(f"Inference time: {end_time - start_time:.3f} seconds")
-
     predictions['images'] = imgs[None].permute(0, 1, 3, 4, 2)
     predictions['conf'] = torch.sigmoid(predictions['conf'])
     edge = depth_edge(predictions['local_points'][..., 2], rtol=0.03)
@@ -313,13 +309,31 @@ def run_model(target_dir, model) -> dict:
     # predictions['points'] = torch.einsum('bij, bnhwj -> bnhwi', se3_inverse(predictions['camera_poses'][:, 0]), homogenize_points(predictions['points']))[..., :3]
     # predictions['camera_poses'] = torch.einsum('bij, bnjk -> bnik', se3_inverse(predictions['camera_poses'][:, 0]), predictions['camera_poses'])
 
+    """
+    return dict(
+            points=points,
+            local_points=local_points,
+            conf=conf,
+            camera_poses=camera_poses,
+            features=hidden,  # [B*N, S, D] - decoder features for potential supervision
+            pos=pos,           # [B*N, S, pos_dim] - positional encoding for
+            dino_features=dino_features,  # [B*N, S, D] - DINOv2 encoder features for potential supervision
+            pi3_features=pi3_features,  # [B*N, S, D] - Pi3 decoder features for potential supervision
+            camera_features=camera_features,
+            conf_features=conf_features,
+            point_features=point_features
+        )
+    """
+
+
     # Convert tensors to numpy
     for key in predictions.keys():
-        if key not in ['features', 'pos', 'dino_features', 'pi3_features', 'conf_features', 'camera_features',
-                        'point_features']:
-            if isinstance(predictions[key], torch.Tensor):
-                predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension
-
+        if isinstance(predictions[key], torch.Tensor) and key not in ['conf_features', 'point_features', 'camera_features', 'features', 'pos', 'dino_features', 'pi3_features']:
+            predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension
+    # remove the keys we don't need to save
+    for key in ['conf_features', 'point_features', 'camera_features', 'features', 'pos', 'dino_features', 'pi3_features']:
+        if key in predictions:
+            del predictions[key]
     # Clean up
     torch.cuda.empty_cache()
     return predictions
@@ -467,8 +481,6 @@ def gradio_demo(
         show_cam=show_cam,
     )
     glbscene.export(file_obj=glbfile)
-
-    print(f"GLB file saved to {glbfile}")
 
     # Cleanup
     del predictions
