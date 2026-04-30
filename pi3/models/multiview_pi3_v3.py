@@ -84,19 +84,24 @@ class EgomotionHead(nn.Module):
         with torch.amp.autocast(device_type='cuda', enabled=False):
             rot_6d = self.rotation_head(feat_pairs.float())  # (B, T-1, 6)
             R_rel = self._rotation_6d_to_matrix(rot_6d)      # (B, T-1, 3, 3)
-            t_rel = self.translation_head(feat_pairs.float()) # (B, T-1, 3)
+            t_rel = self.translation_head(feat_pairs.float()).to(R_rel.dtype)  # (B, T-1, 3)
 
-        # Build relative pose matrices
-        rel_poses = torch.eye(4, device=features.device, dtype=features.dtype)
-        rel_poses = rel_poses.unsqueeze(0).unsqueeze(0).expand(B, T - 1, 4, 4).clone()
-        rel_poses[:, :, :3, :3] = R_rel.to(rel_poses.dtype)
-        rel_poses[:, :, :3, 3] = t_rel.to(rel_poses.dtype)
+        # Build relative pose matrices (no in-place to preserve autograd)
+        dtype = features.dtype
+        R_rel = R_rel.to(dtype)
+        t_rel = t_rel.to(dtype)
+        # Rt: (B, T-1, 3, 4)
+        Rt_rel = torch.cat([R_rel, t_rel.unsqueeze(-1)], dim=-1)
+        bottom = torch.tensor([0., 0., 0., 1.], device=features.device, dtype=dtype)
+        bottom_rel = bottom.view(1, 1, 1, 4).expand(B, T - 1, 1, 4)
+        rel_poses = torch.cat([Rt_rel, bottom_rel], dim=-2)  # (B, T-1, 4, 4)
 
-        # Accumulate to absolute poses
-        abs_poses = torch.eye(4, device=features.device, dtype=features.dtype)
-        abs_poses = abs_poses.unsqueeze(0).unsqueeze(0).expand(B, T, 4, 4).clone()
+        # Accumulate to absolute poses. Build as a list (no in-place writes).
+        identity = torch.eye(4, device=features.device, dtype=dtype)
+        abs_list = [identity.unsqueeze(0).expand(B, 4, 4)]  # frame 0 = identity
         for t in range(1, T):
-            abs_poses[:, t] = torch.matmul(abs_poses[:, t - 1], rel_poses[:, t - 1])
+            abs_list.append(torch.matmul(abs_list[t - 1], rel_poses[:, t - 1]))
+        abs_poses = torch.stack(abs_list, dim=1)  # (B, T, 4, 4)
 
         return abs_poses, rel_poses
 
@@ -144,6 +149,9 @@ class MultiViewPi3V3(nn.Module):
         segmentation_num_classes: int = 7,
         use_motion_head: bool = False,
         # Misc
+        learn_metric_scale: bool = True,   # If False, skip scale head; depth head outputs metric directly
+        camera_embedding_dropout: float = 0.0,  # prob of dropping pose embed during training (per batch)
+        cross_view_dropout: float = 0.0,   # prob of skipping all cross-view attention blocks per batch
         freeze_encoder: bool = True,
         freeze_decoders: bool = False,
         # V3-specific: identity init for cross-view layers
@@ -161,6 +169,9 @@ class MultiViewPi3V3(nn.Module):
         self.use_motion_head = use_motion_head
         self.cross_view_identity_init = cross_view_identity_init
         self.gradient_checkpointing = gradient_checkpointing
+        self.learn_metric_scale = learn_metric_scale
+        self.camera_embedding_dropout = float(camera_embedding_dropout)
+        self.cross_view_dropout = float(cross_view_dropout)
 
         # ----------------------
         #        Encoder
@@ -521,6 +532,15 @@ class MultiViewPi3V3(nn.Module):
         """
         all_outputs = []
 
+        # Cross-view dropout: with probability cross_view_dropout, skip ALL cross-view
+        # blocks for this batch. Teaches the encoder to work without multi-view parallax
+        # — matches navsim's narrow-baseline regime where cross-view signal is weak.
+        skip_cross_view = (
+            self.training
+            and self.cross_view_dropout > 0.0
+            and torch.rand(1, device=hidden.device).item() < self.cross_view_dropout
+        )
+
         for i, blk in enumerate(self.decoder):
             pattern = i % 3
 
@@ -531,6 +551,9 @@ class MultiViewPi3V3(nn.Module):
 
             elif pattern == 1:
                 # Cross-View: (B*T, C*S_full, D)
+                if skip_cross_view:
+                    # No-op: keep hidden as-is, don't touch the cross-view block
+                    continue
                 hidden_flat = hidden.permute(0, 2, 1, 3, 4).reshape(B * T, C * S_full, D)
                 # Positions: tile base_pos for each camera with camera offset
                 pos_per_cam = base_pos.expand(C, -1, -1)  # (C, S_full, 2)
@@ -621,7 +644,16 @@ class MultiViewPi3V3(nn.Module):
         D = hidden.shape[2]
 
         # 2. Add camera embeddings (only if multi-view)
-        if self.camera_embedding is not None and C > 1:
+        # Train-time dropout: with probability `camera_embedding_dropout`, skip
+        # the embedding entirely for this batch. Teaches the encoder to also
+        # work without the pose-aware bias — makes it robust to the
+        # camera_embedding_type=none setting used at navsim eval time.
+        drop_embed = (
+            self.training
+            and self.camera_embedding_dropout > 0.0
+            and torch.rand(1, device=hidden.device).item() < self.camera_embedding_dropout
+        )
+        if self.camera_embedding is not None and C > 1 and not drop_embed:
             hidden = hidden.reshape(B, C, T, S, D)
             if self.camera_embedding_type == 'normalized_pose':
                 cam_embed = self.camera_embedding(camera_extrinsics, camera_intrinsics, (H, W))
@@ -658,15 +690,20 @@ class MultiViewPi3V3(nn.Module):
         if self.use_motion_head:
             motion_hidden = self.motion_decoder(all_hidden, xpos=all_pos)
 
-        # 5.5. Predict metric scale factor (MapAnything-style)
-        # Aggregate decoder features across all cameras, timesteps, and spatial dims
-        scale_features = all_hidden.reshape(B, C * total_frames, S_full, -1)
-        scale_features = scale_features.mean(dim=[1, 2])  # (B, 2*D)
-        log_scale = self.scale_head(scale_features)  # (B, 1)
-        # Clamp to keep metric_scale in [exp(-2), exp(5)] ≈ [0.14, 148]
-        # Target is ~19 (log(19)≈3.0), so this range is generous
-        log_scale = log_scale.clamp(-2.0, 5.0)
-        metric_scale = torch.exp(log_scale)  # Ensure positive, centered at 1.0
+        # 5.5. Metric scale factor. Two modes:
+        #   (a) learn_metric_scale=True: MapAnything-style — scale head predicts
+        #       log-scale aggregated over all tokens. Factorized depth.
+        #   (b) learn_metric_scale=False: skip the scale head. metric_scale=1
+        #       so depth head output is used directly (head learns metric depth).
+        if self.learn_metric_scale:
+            scale_features = all_hidden.reshape(B, C * total_frames, S_full, -1)
+            scale_features = scale_features.mean(dim=[1, 2])  # (B, 2*D)
+            log_scale = self.scale_head(scale_features)  # (B, 1)
+            log_scale = log_scale.clamp(-2.0, 5.0)
+            metric_scale = torch.exp(log_scale)
+        else:
+            metric_scale = torch.ones(B, 1, device=all_hidden.device,
+                                      dtype=all_hidden.dtype)
 
         with torch.amp.autocast(device_type='cuda', enabled=False):
             # Points (up-to-scale relative depth)
@@ -681,12 +718,19 @@ class MultiViewPi3V3(nn.Module):
             local_points_flat = local_points_flat.permute(0, 2, 3, 1)  # (BCT, H, W, 3)
 
             local_points_raw = local_points_flat.reshape(B, C, total_frames, H, W, -1)
-            xy, z_log = local_points_raw.split([2, 1], dim=-1)
-            # Clamp z_log to keep z_relative in [exp(-4), exp(6)] ≈ [0.018, 403]
-            # Prevents degenerate factorization where z_relative explodes and metric_scale collapses
-            # Teacher z_relative is typically mean~1.4, range [0.03, 10]
-            z_log = z_log.clamp(-4.0, 6.0)
-            z_relative = torch.exp(z_log)  # Up-to-scale depth
+            xy, z_raw = local_points_raw.split([2, 1], dim=-1)
+            if self.learn_metric_scale:
+                # Factorized mode: head outputs log-relative depth, scale head
+                # multiplies. Preserves the original Pi3/MapAnything recipe.
+                z_log = z_raw.clamp(-4.0, 6.0)
+                z_relative = torch.exp(z_log)
+            else:
+                # DepthAnything-style: pure linear regression to metric depth.
+                # No exp, no softplus, NO clamp on the supervised tensor itself
+                # (clamp creates dead-zone gradient and kills training).
+                # Just add a 15 m bias so the head starts centered in the
+                # metric range. The L1 loss handles correction directly.
+                z_relative = z_raw + 15.0
 
             # Store relative (up-to-scale) local points
             local_points_relative = torch.cat([xy * z_relative, z_relative], dim=-1)
@@ -725,11 +769,32 @@ class MultiViewPi3V3(nn.Module):
                 motion = motion_flat.reshape(B, C, total_frames, H, W, -1)
 
         # 6. Egomotion (aggregate across cameras and spatial dims)
+        # egomotion_head outputs poses with UNIT-SCALE translations (scale-invariant).
+        # Metric poses are recovered by multiplying translations by metric_scale,
+        # matching the depth factorization: z_metric = metric_scale * z_relative.
         ego_features = all_hidden.reshape(B, C, total_frames, S_full, -1)
         ego_features = ego_features.mean(dim=[1, 3])  # (B, total_frames, 2*D)
-        vehicle_poses, relative_poses = self.egomotion_head(ego_features)
+        vehicle_poses_normalized, relative_poses_normalized = self.egomotion_head(ego_features)
 
-        # Derive camera poses from egomotion + extrinsics (rigid rig assumption)
+        # Rescale translations by metric_scale to get metric-space poses.
+        # Build without in-place ops so autograd can backprop through both metric_scale
+        # and vehicle_poses_normalized.
+        def _apply_scale_to_poses(poses_norm: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            """poses_norm: (B, K, 4, 4), scale: (B, 1). Returns metric poses (B, K, 4, 4)."""
+            K = poses_norm.shape[1]
+            R = poses_norm[..., :3, :3]              # (B, K, 3, 3)
+            t_norm = poses_norm[..., :3, 3]          # (B, K, 3)
+            t_metric = scale.view(B, 1, 1) * t_norm  # (B, K, 3)
+            # Reconstruct the 4x4 matrix without in-place ops
+            Rt = torch.cat([R, t_metric.unsqueeze(-1)], dim=-1)  # (B, K, 3, 4)
+            bottom = torch.tensor([0., 0., 0., 1.], device=poses_norm.device, dtype=poses_norm.dtype)
+            bottom = bottom.view(1, 1, 1, 4).expand(B, K, 1, 4)
+            return torch.cat([Rt, bottom], dim=-2)  # (B, K, 4, 4)
+
+        vehicle_poses = _apply_scale_to_poses(vehicle_poses_normalized, metric_scale)
+        relative_poses = _apply_scale_to_poses(relative_poses_normalized, metric_scale)
+
+        # Derive camera poses from metric egomotion + extrinsics (rigid rig assumption)
         if camera_extrinsics is not None:
             camera_poses = torch.einsum(
                 'btij, bcjk -> bctik',
@@ -742,16 +807,12 @@ class MultiViewPi3V3(nn.Module):
         camera_world_poses = camera_poses
 
         # Unproject local points to world frame using derived camera poses
+        # Both local_points and camera_poses are in metric space now.
         points = torch.einsum(
             'bcnij, bcnhwj -> bcnhwi',
             camera_poses,
             homogenize_points(local_points)
         )[..., :3]
-
-        # Normalize vehicle poses: scale translation by depth normalization factor
-        # so pose loss operates in the same normalized space as depth
-        vehicle_poses_normalized = vehicle_poses.clone()
-        vehicle_poses_normalized[:, :, :3, 3] = vehicle_poses[:, :, :3, 3] / z_mean.reshape(B, 1, 1).expand(-1, total_frames, 3)
 
         result = {
             'points': points,                          # (B, C, T+M, H, W, 3) - metric world frame
@@ -761,10 +822,11 @@ class MultiViewPi3V3(nn.Module):
             'metric_scale': metric_scale,              # (B, 1) - predicted scale factor
             'depth_norm_factor': z_mean.squeeze(),     # normalization factor (to go from normalized → relative)
             'conf': conf,                              # (B, C, T+M, H, W, 1)
-            'camera_poses': camera_poses,              # (B, C, T+M, 4, 4)
-            'vehicle_poses': vehicle_poses,            # (B, T+M, 4, 4) - absolute (accumulated)
-            'vehicle_poses_normalized': vehicle_poses_normalized,  # (B, T+M, 4, 4) - normalized translation
-            'relative_poses': relative_poses,          # (B, T+M-1, 4, 4) - relative frame-to-frame
+            'camera_poses': camera_poses,              # (B, C, T+M, 4, 4) - metric
+            'vehicle_poses': vehicle_poses,            # (B, T+M, 4, 4) - metric (metric_scale * normalized)
+            'vehicle_poses_normalized': vehicle_poses_normalized,  # (B, T+M, 4, 4) - unit-scale translation
+            'relative_poses': relative_poses,          # (B, T+M-1, 4, 4) - metric
+            'relative_poses_normalized': relative_poses_normalized,  # (B, T+M-1, 4, 4) - unit-scale
             'decoder_hidden': all_hidden,              # (B*C*(T+M), S, 2*D) - for distillation
             'n_current_frames': T,
             'n_future_frames': n_future,
